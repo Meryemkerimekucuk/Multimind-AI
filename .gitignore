@@ -5,3 +5,8 @@ __pycache__/
 *.pyc
 .DS_Store
 .streamlit/secrets.toml
+
+chats.db
+user_data/
+uploads/
+generated_images/
