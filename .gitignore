@@ -1,4 +1,7 @@
 .env
-__pycache__/
 .venv/
-chats.db
+venv/
+__pycache__/
+*.pyc
+.DS_Store
+.streamlit/secrets.toml

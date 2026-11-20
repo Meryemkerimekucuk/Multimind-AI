@@ -1,772 +1,692 @@
+import html
+import hashlib
+import json
+import mimetypes
+import re
+from pathlib import Path
 import streamlit as st
-
-from services.gemini_service import safe_generate_text
-
-from services.prompts import (
-    create_generation_prompt,
-    create_improvement_prompt,
-    create_summary_prompt,
-    create_translation_prompt,
-    create_rewrite_prompt,
-    create_idea_prompt,
-)
-
-
+import uuid
 from database import (
-    init_database,
-    create_chat,
-    get_all_chats,
-    get_messages,
-    add_message,
-    rename_chat,
-    delete_chat
+ add_message,
+ create_chat,
+ delete_chat,
+ get_all_chats,
+ get_messages,
+ init_database,
+ rename_chat,
+ create_user, authenticate_user,
 )
+from services.file_service import (
+ read_document_bytes,
+ save_image_bytes,
+ save_uploaded_file,
+)
+from services.gemini_service import generate_text, safe_generate_text, safe_analyze_audio
+from services.image_service import analyze_image, edit_image, generate_image
 
+# ==================================================
+# CONFIGURATION + AUTHENTICATION
 
-# DATABASE
+# ==================================================
+st.set_page_config(page_title="Multimind AI", page_icon="✨", layout="wide")
+PROJECT_DIR = Path(__file__).resolve().parent
+STORAGE_ROOT = PROJECT_DIR / "user_data"
 init_database()
+if "auth_user" not in st.session_state:
+ st.session_state.auth_user = None
+if "guest_mode" not in st.session_state:
+ st.session_state.guest_mode = False
+if not st.session_state.auth_user and not st.session_state.guest_mode:
+ st.markdown("<h1 style='text-align:center;'>✨ Multimind AI</h1>", unsafe_allow_html=True)
+ st.markdown("<h3 style='text-align:center;'>Hoş geldin! Devam etmek için giriş yap.</h3>", unsafe_allow_html=True)
+ login_tab, signup_tab = st.tabs(["Giriş Yap", "Kayıt Ol"])
+ with login_tab:
+     with st.form("login_form"):
+         login_username = st.text_input("Kullanıcı adı")
+         login_password = st.text_input("Şifre", type="password")
+         login_submit = st.form_submit_button("Giriş Yap", use_container_width=True)
+     if login_submit:
+         account = authenticate_user(login_username, login_password)
+         if account:
+             st.session_state.auth_user = account
+             st.session_state.guest_mode = False
+             st.rerun()
+         else:
+             st.error("Kullanıcı adı veya şifre hatalı.")
+ with signup_tab:
+     with st.form("signup_form"):
+         signup_username = st.text_input("Kullanıcı adı (en az 3 karakter)")
+         signup_password = st.text_input("Şifre (en az 8 karakter)", type="password")
+         signup_password_confirm = st.text_input("Şifre tekrar", type="password")
+         signup_submit = st.form_submit_button("Hesap Oluştur", use_container_width=True)
+     if signup_submit:
+         if len(signup_username.strip()) < 3:
+             st.error("Kullanıcı adı en az 3 karakter olmalı.")
+         elif len(signup_password) < 8:
+             st.error("Şifre en az 8 karakter olmalı.")
+         elif signup_password != signup_password_confirm:
+             st.error("Şifreler eşleşmiyor.")
+         elif create_user(signup_username, signup_password):
+             st.success("Hesabın oluşturuldu. Giriş sekmesinden giriş yapabilirsin.")
+         else:
+             st.error("Bu kullanıcı adı zaten alınmış.")
+ st.divider()
+ if st.button("Hesap olmadan devam et", use_container_width=True):
+     st.session_state.guest_mode = True
+     st.rerun()
+ st.stop()
+IS_GUEST = bool(st.session_state.guest_mode)
+OWNER_ID = st.session_state.auth_user["id"] if st.session_state.auth_user else None
+STORAGE_KEY = f"user_{OWNER_ID}" if OWNER_ID is not None else f"guest_{st.session_state.get('guest_storage_key', '')}"
+if IS_GUEST and not st.session_state.get("guest_storage_key"):
+ st.session_state.guest_storage_key = uuid.uuid4().hex
+ STORAGE_KEY = f"guest_{st.session_state.guest_storage_key}"
+USER_DIR = STORAGE_ROOT / STORAGE_KEY
+UPLOAD_DIR = USER_DIR / "uploads"
+GENERATED_DIR = USER_DIR / "generated_images"
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+GENERATED_DIR.mkdir(parents=True, exist_ok=True)
+SUPPORTED_TYPES = ["pdf", "txt", "docx", "png", "jpg", "jpeg", "webp", "mp3", "wav", "m4a", "aac", "ogg", "flac"]
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
+DOCUMENT_EXTENSIONS = {".txt", ".pdf", ".docx"}
+AUDIO_EXTENSIONS = {".mp3", ".wav", ".m4a", ".aac", ".ogg", ".flac"}
 
-
+# ==================================================
 # SESSION STATE
 
-if "messages" not in st.session_state:
-    st.session_state.messages = []
+# ==================================================
+for key, default in {
+ "messages": [], "chats": {}, "chat_ids": {}, "current_chat": None,
+ "session_initialized": False, "voice_processing_error": None,}.items():
+ if key not in st.session_state:
+     st.session_state[key] = default
 
-if "chats" not in st.session_state:
-    st.session_state.chats = {}
+def refresh_chat_index():
+ st.session_state.chats = {}
+ st.session_state.chat_ids = {}
+ if IS_GUEST:
+     for name in st.session_state.get("guest_chats", {}):
+         st.session_state.chats[name] = []
+         st.session_state.chat_ids[name] = name
+ else:
+     for chat in get_all_chats(OWNER_ID):
+         st.session_state.chats[chat["name"]] = []
+         st.session_state.chat_ids[chat["name"]] = chat["id"]
 
-if "chat_ids" not in st.session_state:
-    st.session_state.chat_ids = {}
-
-if "current_chat" not in st.session_state:
-    st.session_state.current_chat = None
-
-
-# DATABASE'DEN SOHBETLERİ YÜKLE
-
+def load_chat_into_session(chat_name: str):
+ chat_id = st.session_state.chat_ids[chat_name]
+ if IS_GUEST:
+     st.session_state.current_chat = chat_name
+     st.session_state.messages = st.session_state.guest_chats.get(chat_name, [])
+     return
+ rows = get_messages(chat_id, OWNER_ID)
+ messages = []
+ for row in rows:
+     item = {"role": row["role"], "content": row["content"], "attachments": []}
+     if row["attachment_json"]:
+         try: item["attachments"] = json.loads(row["attachment_json"])
+         except (TypeError, json.JSONDecodeError): item["attachments"] = []
+     elif row["attachment_path"]:
+         item["attachments"] = [{"path": row["attachment_path"], "name": row["attachment_name"] or Path(row["attachment_path"]).name, "type": row["attachment_type"] or "file"}]
+     messages.append(item)
+ st.session_state.current_chat = chat_name
+ st.session_state.messages = messages
 if not st.session_state.chats:
+ refresh_chat_index()
 
-    database_chats = get_all_chats()
+def start_new_chat():
+ number = 1
+ name = f"Yeni Sohbet {number}"
+ while name in st.session_state.chats:
+     number += 1
+     name = f"Yeni Sohbet {number}"
+ if IS_GUEST:
+     chat_id = name
+     st.session_state.setdefault("guest_chats", {})[name] = []
+ else:
+     chat_id = create_chat(name, OWNER_ID)
+ st.session_state.chats[name] = []
+ st.session_state.chat_ids[name] = chat_id
+ st.session_state.current_chat = name
+ st.session_state.messages = []
+if not st.session_state.session_initialized:
+ start_new_chat()
+ st.session_state.session_initialized = True
 
-    for chat in database_chats:
+def save_message(role, content, attachments=None):
+ chat_name = st.session_state.current_chat
+ chat_id = st.session_state.chat_ids[chat_name]
+ attachments = attachments or []
+ message = {"role": role, "content": content, "attachments": attachments}
+ st.session_state.messages.append(message)
+ if IS_GUEST:
+     st.session_state.setdefault("guest_chats", {})[chat_name] = st.session_state.messages
+ else:
+     first_attachment = attachments[0] if attachments else {}
+     add_message(chat_id, OWNER_ID, role, content,
+                attachment_path=first_attachment.get("path"), attachment_name=first_attachment.get("name"),
+                attachment_type=first_attachment.get("type"),
+                attachment_json=json.dumps(attachments, ensure_ascii=False) if attachments else None)
+ if role == "user":
+     user_message_count = sum(1 for item in st.session_state.messages if item["role"] == "user")
+     if user_message_count == 1:
+         old_name = chat_name
+         content_lines = content.strip().splitlines()
+         base_name = (content_lines[0][:40] if content_lines else "Sesli Mesaj") or "Yeni Sohbet"
+         new_name = base_name
+         suffix = 2
+         while new_name in st.session_state.chats and new_name != old_name:
+             new_name = f"{base_name} ({suffix})"; suffix += 1
+         if IS_GUEST:
+             st.session_state.guest_chats[new_name] = st.session_state.guest_chats.pop(old_name)
+         else:
+             rename_chat(chat_id, OWNER_ID, new_name)
+         st.session_state.chats[new_name] = st.session_state.chats.pop(old_name)
+         st.session_state.chat_ids[new_name] = st.session_state.chat_ids.pop(old_name)
+         st.session_state.current_chat = new_name
 
-        chat_name = chat["name"]
-        chat_id = chat["id"]
+def get_chat_file_context():
+ """Collect user uploads and assistant-generated images from this chat."""
+ documents = []
+ images = []
+ audios = []
+ seen_paths = set()
+ for message in st.session_state.messages:
+     role = message.get("role")
+     for attachment in message.get("attachments", []):
+         path_value = attachment.get("path")
+         if not path_value:
+             continue
+         attachment_type = attachment.get("type", "")
+         is_generated_image = attachment_type == "generated_image"
+         if role != "user" and not (role == "assistant" and is_generated_image):
+             continue
+         path = Path(path_value)
+         path_key = str(path.resolve())
+         if path_key in seen_paths or not path.is_file():
+             continue
+         seen_paths.add(path_key)
+         suffix = path.suffix.lower()
+         name = attachment.get("name", path.name)
+         if role == "user" and suffix in DOCUMENT_EXTENSIONS:
+             extracted_text = attachment.get("extracted_text")
+             if extracted_text is None:
+                 extracted_text = read_document_bytes(name, path.read_bytes())
+             if extracted_text.strip():
+                 documents.append((name, extracted_text))
+         elif suffix in IMAGE_EXTENSIONS or is_generated_image:
+             mime_type = attachment.get("type") if attachment.get("type", "").startswith("image/") else None
+             mime_type = mime_type or mimetypes.guess_type(name)[0] or "image/png"
+             images.append((path.read_bytes(), mime_type, name))
+         elif role == "user" and suffix in AUDIO_EXTENSIONS:
+             mime_type = attachment.get("type") or mimetypes.guess_type(name)[0] or "audio/mpeg"
+             audios.append((path.read_bytes(), mime_type, name))
+ return documents, images, audios
 
-        st.session_state.chats[chat_name] = []
-        st.session_state.chat_ids[chat_name] = chat_id
+def detect_image_generation_request(user_text: str) -> bool:
+    """Detect image-generation intent without relying on specific subject keywords."""
+    text = user_text.lower().strip()
+    if not text:
+        return False
+    # Explicit image-generation commands in Turkish or English. The subject can be anything.
+    explicit_patterns = (
+        r"\b(görsel|resim|fotoğraf|illustrasyon|illüstrasyon|image|picture|photo|illustration)\b.{0,80}\b(oluştur|üret|yarat|çiz|yap|generate|draw|create|make|render)\w*",
+        r"\b(oluştur|üret|yarat|çiz|yap|generate|draw|create|make|render)\w*.{0,80}\b(görsel|resim|fotoğraf|illustrasyon|illüstrasyon|image|picture|photo|illustration)\b",
+        r"\b(görselleştir|resmet|çiz|draw|render|visualize)\w*\b",
+        r"\b(generate|create|make)\s+(me\s+)?(an?\s+)?(image|picture|photo|illustration)\b",
+        r"\b(image|picture|photo|illustration)\s+(generation|prompt)\b",
+    )
+    if any(re.search(pattern, text) for pattern in explicit_patterns):
+        return True
+    # A prompt label means the following text is intended as an image prompt.
+    if re.search(r"(?:^|\n)\s*(?:\*\*)?\s*(?:image\s+)?prompt\s*:", text):
+        return True
+    # Common standalone prompt-to-image wording, regardless of subject or scene.
+    prompt_intent_phrases = (
+        "prompt ile oluştur", "promptla oluştur", "prompt ile üret", "promptla üret",
+        "bunu görsele dönüştür", "görsele dönüştür", "resme dönüştür",
+        "generate from this prompt", "turn this into an image", "visual version of this",
+        "create a visual", "make it visual", "as an image", "in image form",
+    )
+    return any(phrase in text for phrase in prompt_intent_phrases)
 
+def detect_image_edit_request(user_text: str) -> bool:
+ """Detect general follow-up instructions that ask to change an existing image."""
+ text = user_text.lower().strip()
+ direct_edit_phrases = [
+     "rengini", "renklerini", "yap", "olsun", "olsunlar", "görünsün",
+     "görmek istiyorum", "yer alsın", "bulunsun", "dahil et", "ekle",
+     "kaldır", "sil", "değiştir", "düzenle", "arka planı değiştir",
+     "arka planını değiştir", "arka planı sil", "arka planını sil",
+     "fotoğrafı düzenle", "görseli düzenle", "resmi düzenle",
+     "haline getir", "dönüştür", "make it", "change the", "remove the",
+     "add a", "edit this", "edit the image", "change its",
+ ]
+ return any(phrase in text for phrase in direct_edit_phrases)
 
-# HİÇ SOHBET YOKSA İLK SOHBETİ OLUŞTUR
+def render_message(message, index):
+ role = message["role"]
+ content = message["content"]
+ attachments = message.get("attachments", [])
+ if role == "user":
+     if content.strip():
+         safe = html.escape(content).replace("\n", "<br>")
+         st.markdown(
+             f"""<div style="display:flex;justify-content:flex-end;width:100%;margin:18px 0;">
+             <div style="background:#713D61;color:white;padding:12px 20px;border-radius:22px;
+             max-width:78%;overflow-wrap:anywhere;font-size:16px;">{safe}</div></div>""",
+             unsafe_allow_html=True,
+         )
+ else:
+     st.markdown(content)
+ for attachment_index, attachment in enumerate(attachments):
+     path = Path(attachment.get("path", ""))
+     if not path.is_file():
+         continue
+     file_type = attachment.get("type", "")
+     if file_type.startswith("image/") or file_type == "generated_image":
+         st.image(str(path), caption=attachment.get("name", "Görsel"), use_container_width=True)
+         st.download_button(
+             "⬇️ Görseli indir",
+             data=path.read_bytes(),
+             file_name=attachment.get("name", path.name),
+             mime=mimetypes.guess_type(path.name)[0] or "application/octet-stream",
+             key=f"download_{st.session_state.current_chat}_{index}_{attachment_index}",
+         )
+     else:
+         st.caption(f"📎 {attachment.get('name', path.name)}")
 
-
-if not st.session_state.chats:
-
-    chat_id = create_chat("Yeni Sohbet")
-
-    st.session_state.chats["Yeni Sohbet"] = []
-
-    st.session_state.chat_ids["Yeni Sohbet"] = chat_id
-
-    st.session_state.current_chat = "Yeni Sohbet"
-
-    st.session_state.messages = []
-
-
-# AKTİF SOHBETİ YÜKLE
-
-if st.session_state.current_chat is None:
-
-    first_chat = next(iter(st.session_state.chats))
-
-    st.session_state.current_chat = first_chat
-
-
-chat_id = st.session_state.chat_ids[st.session_state.current_chat]
-
-database_messages = get_messages(chat_id)
-
-st.session_state.messages = [
-    {
-        "role": message["role"],
-        "content": message["content"]
-    }
-    for message in database_messages
-]
-
-# CHAT KAYDETME FONKSİYONU
-
-# CHAT KAYDETME
-
-def save_to_chat(role, content):
-
-    current_chat = st.session_state.current_chat
-
-    chat_id = st.session_state.chat_ids[current_chat]
-
-    # Session state'e ekle
-    st.session_state.messages.append(
-        {"role": role,"content": content})
-
-    # Database'e ekle
-    add_message(chat_id,role,content)
-
-    # İlk kullanıcı mesajı sohbet adı olsun
-    if role == "user":
-
-        user_messages = [
-            message["content"]
-            for message in st.session_state.messages
-            if message["role"] == "user"
-        ]
-
-        if len(user_messages) == 1:
-
-            old_chat_name = current_chat
-
-            new_chat_name = user_messages[0][:40]
-
-            base_name = new_chat_name
-            counter = 2
-
-            while (
-                new_chat_name in st.session_state.chats
-                and new_chat_name != old_chat_name
-            ):
-
-                new_chat_name = (f"{base_name} ({counter})")
-
-                counter += 1
-
-            # Database'de ismi değiştir
-            rename_chat(chat_id,new_chat_name)
-
-            # Session state'i güncelle
-            st.session_state.chats[new_chat_name] = st.session_state.chats.pop(old_chat_name)
-
-            st.session_state.chat_ids[new_chat_name] = st.session_state.chat_ids.pop(old_chat_name)
-
-            st.session_state.current_chat = (new_chat_name)
-
-
+# ==================================================
 # SIDEBAR
 
+# ==================================================
 with st.sidebar:
-
-    st.title("✨ AI Text Assistant")
-
-    st.write("LLM destekli metin işleme ve üretim uygulaması.")
-
-    st.divider()
-
-
-    
-    # YENİ SOHBET
-  
-
-    if st.button("➕ Yeni Sohbet",use_container_width=True):
-
-        chat_number = (len(st.session_state.chats) + 1)
-
-        chat_name = (f"Yeni Sohbet {chat_number}")
-
-        chat_id = create_chat(chat_name)
-
-        st.session_state.chats[chat_name] = []
-
-        st.session_state.chat_ids[chat_name] = chat_id
-
-        st.session_state.current_chat = (chat_name)
-
-        st.session_state.messages = []
-
-        st.rerun()
-
-
-    st.divider()
-
-
-    # ÖZELLİKLER
-
-    st.subheader("🚀 Özellikler")
-
-    st.write("📝 Metin oluşturma")
-    st.write("✏️ Metin iyileştirme")
-    st.write("📌 Metin özetleme")
-    st.write("🌍 Metin çevirme")
-    st.write("🔄 Metin yeniden yazma")
-    st.write("💡 İçerik fikri üretme")
-
-
-    st.divider()
-
-
-    # CHAT HISTORY
-
-    st.subheader("💬 Chat History")
-
-    st.divider()
-
-    st.subheader("🗂️ Sohbetler")
-
-
-    # SADECE BİR TANE SOHBET DÖNGÜSÜ VAR
-    for chat_name in list(st.session_state.chats.keys()):
-
-        chat_id = st.session_state.chat_ids[chat_name]
-
-        col1, col2 = st.columns([6, 1],vertical_alignment="center")
-
-
-        # SOHBETE GİT
-
-        with col1:
-
-            if st.button(
-                f"💬 {chat_name}",
-                key=f"open_chat_{chat_id}",
-                use_container_width=True
-            ):
-
-                st.session_state.current_chat = (chat_name)
-
-                database_messages = get_messages(chat_id)
-
-                st.session_state.messages = [
-                    {
-                        "role": message["role"],
-                        "content": message["content"]
-                    }
-                    for message in database_messages
-                ]
-
-                st.rerun()
-
-
-        # SOHBETİ SİL
-        
-
-        with col2:
-
-            if st.button("🗑️",key=f"delete_chat_{chat_id}"):
-
-                delete_chat(chat_id)
-
-                del st.session_state.chats[chat_name]
-
-                del st.session_state.chat_ids[chat_name]
-
-
-                # Silinen sohbet aktif sohbetse
-                if (st.session_state.current_chat == chat_name):
-
-                    if st.session_state.chats:
-
-                        new_chat_name = next(iter(st.session_state.chats))
-
-                        st.session_state.current_chat = (new_chat_name)
-
-                        new_chat_id = (st.session_state.chat_ids[new_chat_name])
-
-                        database_messages = (get_messages(new_chat_id))
-
-                        st.session_state.messages = [
-                            {
-                                "role": message["role"],
-                                "content": message["content"]
-                            }
-                            for message in database_messages
-                        ]
-
-                    else:
-
-                        new_chat_id = create_chat("Yeni Sohbet")
-
-                        st.session_state.chats["Yeni Sohbet"] = []
-
-                        st.session_state.chat_ids["Yeni Sohbet"] = new_chat_id
-
-                        st.session_state.current_chat = ("Yeni Sohbet")
-
-                        st.session_state.messages = []
-
-
-                st.rerun()
-
-
-    st.divider()
-
-    st.caption(
-        "Powered by Google Gemini"
-    )
-
-# ANA SAYFA
-
-st.title("✨ AI Text Assistant")
-
-st.markdown("### Yapay zekâ ile metin üretin ve dönüştürün.")
-
-st.caption("Gemini destekli yapay zekâ metin asistanı")
-
-
-st.divider()
-
-
-# MODEL AYARLARI
-
-st.subheader("⚙️ Model Ayarları")
-
-
-temperature = st.slider(
-    "Temperature",
-    min_value=0.0,
-    max_value=1.0,
-    value=0.7,
-    step=0.1
+ st.title("✨ Multimind AI")
+ st.caption("Yapay zekâ destekli kişisel asistanın")
+ st.caption("Misafir modu — sohbetler bu oturumda tutulur" if IS_GUEST else "Kullanıcı: " + st.session_state.auth_user["username"])
+ if st.button("🚪 Çıkış / Oturumu kapat", use_container_width=True):
+     if IS_GUEST:
+         import shutil
+         shutil.rmtree(USER_DIR, ignore_errors=True)
+     for key in list(st.session_state.keys()):
+         del st.session_state[key]
+     st.rerun()
+ st.divider()
+ if st.button("➕ Yeni Sohbet", use_container_width=True):
+     start_new_chat()
+     st.rerun()
+ st.divider()
+ st.subheader("🚀 Neler yapabilirim?")
+ for feature in [
+     "📝 Metin oluşturma ve düzenleme",
+     "📌 Metin özetleme ve çeviri",
+     "💡 İçerik fikri üretme",
+     "🎨 Cloudflare ile görsel üretme",
+     "🖼️ Cloudflare ile görsel analizi",
+     "📂 TXT, PDF ve DOCX analizi",
+     "📎 Birden fazla dosya yükleme",
+     "🎧 Ses dosyası yükleme ve Gemini ile analiz",
+ ]:
+     st.caption(feature)
+ st.divider()
+ st.subheader("💬 Chat History")
+ for chat_index, chat_name in enumerate(list(st.session_state.chats.keys())):
+     chat_id = st.session_state.chat_ids[chat_name]
+     col_open, col_delete = st.columns([5, 1])
+     with col_open:
+         if st.button(f"💬 {chat_name}", key=f"open_{chat_index}_{chat_id}", use_container_width=True):
+             load_chat_into_session(chat_name)
+             st.rerun()
+     with col_delete:
+         if st.button("🗑️", key=f"delete_{chat_index}_{chat_id}"):
+             if IS_GUEST:
+                 st.session_state.guest_chats.pop(chat_name, None)
+             else:
+                 delete_chat(chat_id, OWNER_ID)
+             st.session_state.chats.pop(chat_name, None)
+             st.session_state.chat_ids.pop(chat_name, None)
+             if st.session_state.current_chat == chat_name:
+                 if st.session_state.chats:
+                     load_chat_into_session(next(iter(st.session_state.chats)))
+                 else:
+                     start_new_chat()
+             st.rerun()
+ st.divider()
+
+# ==================================================
+# MAIN CHAT
+
+# ==================================================
+st.markdown(
+ "<h1 style='text-align:center;margin-bottom:36px;'>✨ Multimind AI</h1>",
+ unsafe_allow_html=True,
 )
+if not st.session_state.messages:
+ st.markdown(
+     "<h3 style='text-align:center;'>Bugün sana nasıl yardımcı olabilirim?</h3>",
+     unsafe_allow_html=True,
+ )
+ st.markdown(
+     "<p style='text-align:center;color:#999;'>Metin, belge, görsel ve ses dosyalarıyla çalışabilirsin.</p>",
+     unsafe_allow_html=True,
+ )
+for message_index, message in enumerate(st.session_state.messages):
+ render_message(message, message_index)
+if st.session_state.get("voice_processing_error"):
+ st.error(st.session_state.voice_processing_error)
 
+# ==================================================
+# CHAT INPUT AND MULTIMODAL ROUTING
 
-max_output_tokens = st.slider(
-    "Max Output Tokens",
-    min_value=200,
-    max_value=2000,
-    value=1000,
-    step=100
+# ==================================================
+st.markdown(
+ """
+
+ <style>
+
+ /* Sidebar genişliğine müdahale ETME: Streamlit doğal resize/collapse davranışı */
+
+ /* Streamlit'in doğal alt composer'ı main alanına göre konumlanır.
+
+    Mikrofon yalnızca sağ kenara sabitlenir; sidebar genişliğini etkilemez. */
+
+ .st-key-mic_toggle_button {
+
+     position: fixed !important;
+
+     right: 5rem !important;
+
+     bottom: 3.5rem !important;
+
+     width: 3.25rem !important;
+
+     z-index: 1001 !important;
+
+     margin: 0 !important;
+
+ }
+
+ .st-key-mic_toggle_button button {
+
+     width: 3.25rem !important;
+
+     height: 3.25rem !important;
+
+     min-height: 3.25rem !important;
+
+     border-radius: 0.9rem !important;
+
+ }
+
+ /* Input, Streamlit'in main alanına göre alt konumlandırmasını korur.
+
+    Sağda mikrofon için küçük yer bırakılır. */
+
+ div[data-testid="stChatInput"] {
+
+     width: calc(100% - 5rem) !important;
+
+     max-width: calc(100% - 5rem) !important;
+
+ }
+
+ /* Alt giriş arkasında sohbet mesajları kalmasın */
+
+ section[data-testid="stMain"] .block-container {
+
+     padding-bottom: 7rem !important;
+
+ }
+
+ @media (max-width: 700px) {
+
+     .st-key-mic_toggle_button {
+
+         right: 4.25rem !important;
+
+         bottom: 3.5rem !important;
+
+     }
+
+     div[data-testid="stChatInput"] {
+
+         width: calc(100% - 4.25rem) !important;
+
+         max-width: calc(100% - 4.25rem) !important;
+
+     }
+
+ }
+
+ </style>
+
+ """,
+ unsafe_allow_html=True,
 )
-
-
-# MOD SEÇİMİ
-
-
-mode = st.radio(
-    "Ne yapmak istiyorsunuz?",
-    [
-        "Yeni Metin Oluştur",
-        "Mevcut Metni İyileştir",
-        "Metni Özetle",
-        "Metni Çevir",
-        "Metni Yeniden Yaz",
-        "İçerik Fikri Üret"
-    ],
-    horizontal=True
+user_prompt = None
+voice_recording = None
+mic_clicked = False
+# Ses paneli normal akışta chat input'un hemen üstünde gösterilir.
+if st.session_state.get("show_mic_recording", False):
+ voice_recording = st.audio_input(
+     "Ses kaydet",
+     key="voice_message_input",
+     label_visibility="collapsed"
+ )
+# st.chat_input: Streamlit'in native fixed-bottom yerleşimi ve main alanı
+# sidebar açık/kapalı durumuna göre otomatik genişlik değişimini korur.
+user_prompt = st.chat_input(
+ "Bana bir şey sor...",
+ accept_file="multiple",
+ file_type=SUPPORTED_TYPES,
+ key="main_chat_input",
 )
-
-
-# 1. YENİ METİN OLUŞTUR
-
-if mode == "Yeni Metin Oluştur":
-
-    topic = st.text_area("Ne hakkında bir metin oluşturmak istiyorsunuz?")
-
-
-    text_type = st.selectbox(
-        "Metin türünü seçin:",
-        [
-            "Genel Metin",
-            "LinkedIn Gönderisi",
-            "Blog Yazısı",
-            "E-posta",
-            "Sosyal Medya Gönderisi"
-        ]
-    )
-
-
-    tone = st.selectbox(
-        "Metnin tonunu seçin:",
-        [
-            "Profesyonel",
-            "Samimi",
-            "Akademik",
-            "Eğlenceli"
-        ]
-    )
-
-
-    length = st.selectbox(
-        "Metin uzunluğunu seçin:",
-        [
-            "Kısa",
-            "Orta",
-            "Uzun"
-        ]
-    )
-
-
-    generate_button = st.button("✨ Metin Oluştur")
-
-
-    if generate_button:
-
-        if not topic.strip():
-
-            st.warning("Lütfen bir konu girin.")
-
-        else:
-
-            # Kullanıcı mesajını kaydet
-            save_to_chat("user",topic)
-
-
-            # Konuşma geçmişini oluştur
-            conversation_history = ""
-
-
-            for message in st.session_state.messages:
-
-                conversation_history += (
-                    f"{message['role']}: "
-                    f"{message['content']}\n"
-                )
-
-
-            # Prompt oluştur
-            prompt = create_generation_prompt(
-                topic=topic,
-                text_type=text_type,
-                tone=tone,
-                length=length,
-                conversation_history=conversation_history
-            )
-
-
-            # Gemini
-            with st.spinner("✨ Gemini yanıt oluşturuyor..."):
-
-                    response = safe_generate_text(
-                    prompt,
-                    temperature=temperature,
-                    max_output_tokens=max_output_tokens
-                )
-
-
-            if response:
-
-                save_to_chat("assistant",response)
-
-
-                st.subheader("✨ Oluşturulan Metin")
-
-                st.write(response)
-
-
-            else:
-
-                st.error(
-                    "❌ Metin oluşturulurken bir hata oluştu. "
-                    "Lütfen tekrar deneyin."
-                )
-
-
-# 2. METNİ İYİLEŞTİR
-
-elif mode == "Mevcut Metni İyileştir":
-
-    topic = st.text_area("İyileştirmek istediğiniz metni girin:")
-
-
-    improve_button = st.button("✨ Metni İyileştir")
-
-
-    if improve_button:
-
-        if not topic.strip():
-
-            st.warning("Lütfen bir metin girin.")
-
-        else:
-
-            prompt = create_improvement_prompt(topic)
-
-
-            with st.spinner("✨ Gemini metni iyileştiriyor..."):
-
-                response = safe_generate_text(
-                    prompt,
-                    temperature=temperature,
-                    max_output_tokens=max_output_tokens
-                )
-
-
-            if response:
-
-                save_to_chat("user",topic)
-
-                save_to_chat("assistant",response)
-
-
-                st.subheader("✨ İyileştirilmiş Metin")
-
-                st.write(response)
-
-
-            else:
-
-                st.error(
-                    "❌ Metin iyileştirilirken bir hata oluştu. "
-                    "Lütfen tekrar deneyin."
-                )
-
-
-# 3. METNİ ÖZETLE
-
-elif mode == "Metni Özetle":
-
-    topic = st.text_area("Özetlemek istediğiniz metni girin:")
-
-
-    summary_length = st.selectbox(
-        "Özet uzunluğunu seçin:",
-        [
-            "Çok Kısa",
-            "Kısa",
-            "Detaylı"
-        ]
-    )
-
-
-    summarize_button = st.button("✨ Metni Özetle")
-
-
-    if summarize_button:
-
-        if not topic.strip():
-
-            st.warning("Lütfen özetlemek istediğiniz metni girin.")
-
-        else:
-
-            prompt = create_summary_prompt(
-                topic=topic,
-                summary_length=summary_length
-            )
-
-
-            with st.spinner("✨ Gemini metni özetliyor..."):
-
-                response = safe_generate_text(
-                    prompt,
-                    temperature=temperature,
-                    max_output_tokens=max_output_tokens
-                )
-
-
-            if response:
-
-                save_to_chat("user",topic)
-
-                save_to_chat("assistant",response)
-
-
-                st.subheader("✨ Özet")
-
-                st.write(response)
-
-
-            else:
-
-                st.error(
-                    "❌ Metin özetlenirken bir hata oluştu. "
-                    "Lütfen tekrar deneyin."
-                )
-
-
-# 4. METNİ ÇEVİR
-
-elif mode == "Metni Çevir":
-
-    topic = st.text_area("Çevirmek istediğiniz metni girin:")
-
-
-    target_language = st.selectbox(
-        "Hedef dili seçin:",
-        [
-            "İngilizce",
-            "Türkçe",
-            "Almanca",
-            "Fransızca",
-            "İspanyolca"
-        ]
-    )
-
-
-    translate_button = st.button("🌍 Metni Çevir")
-
-
-    if translate_button:
-
-        if not topic.strip():
-
-            st.warning("Lütfen çevirmek istediğiniz metni girin.")
-
-        else:
-
-            prompt = create_translation_prompt(
-                topic=topic,
-                target_language=target_language
-            )
-
-
-            with st.spinner("🌍 Gemini metni çeviriyor..."):
-
-                response = safe_generate_text(
-                    prompt,
-                    temperature=temperature,
-                    max_output_tokens=max_output_tokens
-                )
-
-
-            if response:
-
-                save_to_chat("user",topic)
-
-                save_to_chat("assistant",response)
-
-
-                st.subheader("✨ Çeviri")
-
-                st.write(response)
-
-
-            else:
-
-                st.error(
-                    "❌ Metin çevrilirken bir hata oluştu. "
-                    "Lütfen tekrar deneyin."
-                )
-
-
-# 5. METNİ YENİDEN YAZ
-
-elif mode == "Metni Yeniden Yaz":
-
-    topic = st.text_area("Yeniden yazmak istediğiniz metni girin:")
-
-
-    rewrite_style = st.selectbox(
-        "Metnin nasıl yeniden yazılmasını istiyorsunuz?",
-        [
-            "Daha Resmi",
-            "Daha Samimi",
-            "Daha Akademik",
-            "Daha Etkileyici",
-            "Daha Sade"
-        ]
-    )
-
-
-    rewrite_button = st.button("✨ Metni Yeniden Yaz")
-
-
-    if rewrite_button:
-
-        if not topic.strip():
-
-            st.warning("Lütfen yeniden yazmak istediğiniz metni girin.")
-
-        else:
-
-            prompt = create_rewrite_prompt(topic=topic,rewrite_style=rewrite_style)
-
-
-            with st.spinner("✨ Gemini metni yeniden yazıyor..."):
-
-                response = safe_generate_text(
-                    prompt,
-                    temperature=temperature,
-                    max_output_tokens=max_output_tokens
-                )
-
-
-            if response:
-
-                save_to_chat("user",topic)
-
-                save_to_chat("assistant",response)
-
-
-                st.subheader("✨ Yeniden Yazılmış Metin")
-
-                st.write(response)
-
-
-            else:
-
-                st.error(
-                    "❌ Metin yeniden yazılırken bir hata oluştu. "
-                    "Lütfen tekrar deneyin."
-                )
-
-
-# 6. İÇERİK FİKRİ ÜRET
-
-elif mode == "İçerik Fikri Üret":
-
-    topic = st.text_input("Hangi konuda içerik fikri istiyorsunuz?")
-
-
-    platform = st.selectbox(
-        "İçeriğin yayınlanacağı platform:",
-        [
-            "LinkedIn",
-            "Instagram",
-            "Blog",
-            "X"
-        ]
-    )
-
-
-    idea_count = st.selectbox(
-        "Kaç fikir üretilecek?",
-        [
-            5,
-            10,
-            15
-        ]
-    )
-
-
-    idea_button = st.button("💡 Fikir Üret")
-
-
-    if idea_button:
-
-        if not topic.strip():
-
-            st.warning("Lütfen bir konu girin.")
-
-        else:
-
-            prompt = create_idea_prompt(
-                topic=topic,
-                platform=platform,
-                idea_count=idea_count
-            )
-
-
-            with st.spinner("💡 İçerik fikirleri oluşturuluyor..."):
-
-                response = safe_generate_text(
-                    prompt,
-                    temperature=temperature,
-                    max_output_tokens=max_output_tokens
-                )
-
-
-            if response:
-
-                save_to_chat("user",topic)
-
-                save_to_chat("assistant",response)
-
-
-                st.subheader("💡 İçerik Fikirleri")
-
-                st.write(response)
-
-
-            else:
-
-                st.error(
-                    "❌ İçerik fikirleri oluşturulurken bir hata oluştu. "
-                    "Lütfen tekrar deneyin."
-                )
+# Buton CSS ile sağ alt köşeye sabitlenir.
+mic_clicked = st.button(
+ "🎙️",
+ help="Sesli mesaj kaydet",
+ key="mic_toggle_button",
+)
+if mic_clicked:
+ st.session_state.show_mic_recording = not st.session_state.get("show_mic_recording", False)
+ if st.session_state.show_mic_recording:
+     st.session_state.voice_processing_error = None
+ st.rerun()
+if voice_recording is not None:
+ voice_bytes = voice_recording.getvalue()
+ voice_hash = hashlib.sha256(voice_bytes).hexdigest()
+ if st.session_state.get("last_processed_voice_hash") != voice_hash:
+     st.session_state.last_processed_voice_hash = voice_hash
+     chat_id = st.session_state.chat_ids[st.session_state.current_chat]
+     voice_name = voice_recording.name or "voice_message.wav"
+     voice_path = UPLOAD_DIR / f"chat_{hashlib.sha256(str(chat_id).encode()).hexdigest()[:12]}" / f"voice_{voice_hash[:12]}_{Path(voice_name).name}"
+     voice_path.parent.mkdir(parents=True, exist_ok=True)
+     voice_path.write_bytes(voice_bytes)
+     voice_mime = voice_recording.type or mimetypes.guess_type(voice_name)[0] or "audio/wav"
+     voice_attachment = {"path": str(voice_path), "name": voice_name, "type": voice_mime}
+     transcription_prompt = (
+         "Bu ses kaydındaki konuşmayı eksiksiz ve doğru şekilde yazıya dök. "
+         "Yalnızca konuşulan metni döndür; başlık, 'transkripsiyon' etiketi, "
+         "açıklama veya yorum ekleme."
+     )
+     with st.spinner("Konuşman yazıya dönüştürülüyor..."):
+         transcript = safe_analyze_audio(
+             transcription_prompt, voice_bytes, voice_mime, max_output_tokens=1200
+         )
+     if transcript and transcript.strip():
+         transcript = transcript.strip()
+         save_message("user", transcript, [voice_attachment])
+         with st.spinner("Yanıt hazırlanıyor..."):
+             try:
+                     document_files, image_files, audio_files = get_chat_file_context()
+                     if detect_image_generation_request(transcript):
+                         with st.spinner("🎨 Sesli prompttan görsel oluşturuluyor..."):
+                             generated_bytes = generate_image(transcript)
+                         generated_name = f"generated_{chat_id}_{len(st.session_state.messages)}.png"
+                         generated_path = GENERATED_DIR / generated_name
+                         path_string = save_image_bytes(generated_bytes, generated_path)
+                         save_message(
+                             "assistant",
+                             "🎨 Görselin başarıyla oluşturuldu!",
+                             [{"path": path_string, "name": generated_name, "type": "generated_image"}],
+                         )
+                         voice_answer = None
+                     elif image_files and detect_image_edit_request(transcript):
+                         source_bytes, source_mime, source_name = image_files[-1]
+                         with st.spinner("🪄 Sesli talimatla görsel düzenleniyor..."):
+                             edited_bytes = edit_image(source_bytes, source_mime, transcript)
+                         edited_name = f"edited_{chat_id}_{len(st.session_state.messages)}.png"
+                         edited_path = GENERATED_DIR / edited_name
+                         path_string = save_image_bytes(edited_bytes, edited_path)
+                         save_message(
+                             "assistant",
+                             f"🪄 **{source_name}** görseli sesli talimatına göre düzenlendi.",
+                             [{"path": path_string, "name": edited_name, "type": "generated_image"}],
+                         )
+                         voice_answer = None
+                     else:
+                         voice_answer = generate_text(transcript, temperature=0.7, max_output_tokens=1800)
+             except Exception as voice_error:
+                 voice_answer = None
+                 st.session_state.voice_processing_error = f"Sesli mesajın yanıtı oluşturulamadı: {voice_error}"
+         if voice_answer and voice_answer.strip():
+             save_message("assistant", voice_answer.strip())
+         elif voice_answer == "":
+             st.session_state.voice_processing_error = "Gemini boş yanıt döndürdü. API/model ayarlarını kontrol et."
+     else:
+         st.session_state.voice_processing_error = "Konuşma yazıya dönüştürülemedi. Tekrar deneyebilir misin?"
+     st.session_state.show_mic_recording = False
+     st.rerun()
+if user_prompt is not None:
+ user_text = (user_prompt.text or "").strip()
+ uploaded_files = user_prompt.files or []
+ if not user_text and uploaded_files:
+     user_text = "Yüklediğim dosyaları incele ve açıkla."
+ if user_text or uploaded_files:
+     chat_id = st.session_state.chat_ids[st.session_state.current_chat]
+     saved_attachments = []
+     upload_errors = []
+     # Save current uploads. Extract document text and persist it in attachment metadata.
+     for file_number, uploaded_file in enumerate(uploaded_files, start=1):
+         safe_name = Path(uploaded_file.name).name
+         suffix = Path(safe_name).suffix.lower()
+         stored_path = UPLOAD_DIR / f"chat_{hashlib.sha256(str(chat_id).encode()).hexdigest()[:12]}" / f"{file_number}_{safe_name}"
+         try:
+             path_string = save_uploaded_file(uploaded_file, stored_path)
+             mime_type = uploaded_file.type or mimetypes.guess_type(safe_name)[0] or "application/octet-stream"
+             attachment = {
+                 "path": path_string,
+                 "name": safe_name,
+                 "type": mime_type,
+             }
+             if suffix in DOCUMENT_EXTENSIONS:
+                 extracted_text = read_document_bytes(safe_name, uploaded_file.getvalue())
+                 attachment["extracted_text"] = extracted_text
+             elif suffix not in IMAGE_EXTENSIONS and suffix not in AUDIO_EXTENSIONS:
+                 upload_errors.append(f"{safe_name}: Desteklenmeyen dosya türü.")
+                 continue
+             saved_attachments.append(attachment)
+         except Exception as error:
+             upload_errors.append(f"{safe_name}: {error}")
+     display_text = user_text
+     if saved_attachments:
+         display_text += "\n\n📎 Eklenen dosyalar: " + ", ".join(item["name"] for item in saved_attachments)
+     save_message("user", display_text, saved_attachments)
+     for error in upload_errors:
+         st.warning(error)
+     # IMPORTANT: Build context from all user attachments in this chat, not only this turn.
+     # This makes follow-up questions work without uploading the same file again.
+     try:
+         document_files, image_files, audio_files = get_chat_file_context()
+     except Exception as error:
+         st.error(f"Sohbetteki dosyalar okunamadı: {error}")
+         st.stop()
+     try:
+         # Route image edits before ordinary image analysis. Use the latest image in this chat.
+         is_generation_request = detect_image_generation_request(user_text)
+         is_edit_request = bool(image_files) and detect_image_edit_request(user_text) and not is_generation_request
+         current_audio_attachments = [
+             attachment for attachment in saved_attachments
+             if Path(attachment["name"]).suffix.lower() in AUDIO_EXTENSIONS
+         ]
+         if current_audio_attachments:
+             attachment = current_audio_attachments[-1]
+             audio_path = Path(attachment["path"])
+             audio_bytes = audio_path.read_bytes()
+             audio_mime = attachment.get("type") or mimetypes.guess_type(attachment["name"])[0] or "audio/mpeg"
+             audio_name = attachment["name"]
+             audio_prompt = user_text or "Bu ses kaydını yazıya dök, içeriğini analiz et ve önemli noktaları açıkla."
+             with st.spinner(f"🎧 {audio_name} Gemini ile analiz ediliyor..."):
+                 audio_answer = safe_analyze_audio(audio_prompt, audio_bytes, audio_mime, max_output_tokens=1800)
+             if audio_answer:
+                 save_message("assistant", audio_answer)
+             else:
+                 st.error("Ses analiz edilemedi. Gemini API anahtarını ve ses dosyasının formatını kontrol et.")
+         elif is_edit_request:
+             source_bytes, source_mime, source_name = image_files[-1]
+             with st.spinner("🪄 Görselin Cloudflare ile düzenleniyor..."):
+                 edited_bytes = edit_image(source_bytes, source_mime, user_text)
+             edited_name = f"edited_{chat_id}_{len(st.session_state.messages)}.png"
+             edited_path = GENERATED_DIR / edited_name
+             path_string = save_image_bytes(edited_bytes, edited_path)
+             save_message(
+                 "assistant",
+                 f"🪄 **{source_name}** görseli isteğine göre düzenlendi.",
+                 [{"path": path_string, "name": edited_name, "type": "generated_image"}],
+             )
+         elif is_generation_request:
+             with st.spinner("🎨 Görselin Cloudflare ile oluşturuluyor..."):
+                 generated_bytes = generate_image(user_text)
+             generated_name = f"generated_{chat_id}_{len(st.session_state.messages)}.png"
+             generated_path = GENERATED_DIR / generated_name
+             path_string = save_image_bytes(generated_bytes, generated_path)
+             save_message(
+                 "assistant",
+                 "🎨 Görselin başarıyla oluşturuldu!",
+                 [{"path": path_string, "name": generated_name, "type": "generated_image"}],
+             )
+         else:
+             assistant_parts = []
+             for image_bytes, mime_type, image_name in image_files:
+                 with st.spinner(f"🖼️ {image_name} Cloudflare ile analiz ediliyor..."):
+                     image_answer = analyze_image(
+                         image_bytes,
+                         mime_type,
+                         user_text or "Bu görseli ayrıntılı şekilde açıkla.",
+                     )
+                 assistant_parts.append(f"### Görsel analizi: {image_name}\n{image_answer}")
+             if document_files:
+                 document_context = "\n\n".join(
+                     f"--- {name} ---\n{text}" for name, text in document_files
+                 )
+                 document_prompt = f"""Kullanıcının son isteği:
+{user_text or 'Yüklenen belgeleri açıkla ve özetle.'}
+Bu sohbet içinde yüklenmiş belgelerin içerikleri:
+{document_context}
+Yanıtını belgelerin içeriğine dayandır. Belgede bulunmayan bilgileri açıkça belirt. Kullanıcı takip sorusu soruyorsa önceki belge bağlamını kullan."""
+                 with st.spinner("📄 Belgeler Gemini ile analiz ediliyor..."):
+                     document_answer = safe_generate_text(
+                         document_prompt,
+                         temperature=0.7,
+                         max_output_tokens=1800,
+                     )
+                 if document_answer:
+                     assistant_parts.append(f"### Belge yanıtı\n{document_answer}")
+                 else:
+                     assistant_parts.append("Belge yanıtı oluşturulamadı. Gemini bağlantını kontrol et.")
+             if not image_files and not document_files:
+                 with st.spinner("Yanıt hazırlanıyor..."):
+                     text_answer = safe_generate_text(
+                         user_text,
+                         temperature=0.7,
+                         max_output_tokens=1500,
+                     )
+                 if text_answer:
+                     assistant_parts.append(text_answer)
+                 else:
+                     st.error("Yanıt oluşturulamadı. Gemini bağlantını ve API anahtarını kontrol et.")
+             if assistant_parts:
+                 save_message("assistant", "\n\n".join(assistant_parts))
+     except Exception as error:
+         st.session_state.voice_processing_error = f"İşlem sırasında hata oluştu: {error}"
+     st.rerun()
