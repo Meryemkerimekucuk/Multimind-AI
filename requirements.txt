@@ -3,6 +3,6 @@ google-genai
 python-dotenv
 pandas
 Pillow
-PyPDF2
+pypdf
 python-docx
 requests
