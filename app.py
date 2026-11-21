@@ -224,31 +224,52 @@ def get_chat_file_context():
  return documents, images, audios
 
 def detect_image_generation_request(user_text: str) -> bool:
-    """Detect image-generation intent without relying on specific subject keywords."""
+    """Detect image-generation intent from flexible natural-language requests."""
     text = user_text.lower().strip()
     if not text:
         return False
-    # Explicit image-generation commands in Turkish or English. The subject can be anything.
-    explicit_patterns = (
-        r"\b(görsel|resim|fotoğraf|illustrasyon|illüstrasyon|image|picture|photo|illustration)\b.{0,80}\b(oluştur|üret|yarat|çiz|yap|generate|draw|create|make|render)\w*",
-        r"\b(oluştur|üret|yarat|çiz|yap|generate|draw|create|make|render)\w*.{0,80}\b(görsel|resim|fotoğraf|illustrasyon|illüstrasyon|image|picture|photo|illustration)\b",
-        r"\b(görselleştir|resmet|çiz|draw|render|visualize)\w*\b",
-        r"\b(generate|create|make)\s+(me\s+)?(an?\s+)?(image|picture|photo|illustration)\b",
-        r"\b(image|picture|photo|illustration)\s+(generation|prompt)\b",
+
+
+    # Keep this subject-agnostic: the user can request any scene or object.
+    # Match Turkish suffixes (e.g. "görseli", "resim oluşturur musun") by
+    # checking stems rather than requiring exact whole-word matches.
+    image_terms = (
+        "görsel", "res", "fotoğraf", "fotograf", "illustrasyon",
+        "illüstrasyon", "image", "picture", "photo", "illustration",
+        "artwork", "art", "poster", "wallpaper",
     )
-    if any(re.search(pattern, text) for pattern in explicit_patterns):
+    creation_terms = (
+        "oluştur", "olustur", "üret", "uret", "yarat", "create", "generate",
+        "make", "render",
+    )
+    drawing_terms = ("çiz", "ciz", "draw", "sketch", "paint", "resmet", "illustrate")
+
+    has_image_term = any(term in text for term in image_terms)
+    has_creation_term = any(term in text for term in creation_terms)
+    has_drawing_term = any(term in text for term in drawing_terms)
+
+
+    # Image noun + creation verb in any order, including Turkish suffixes.
+    if has_image_term and (has_creation_term or has_drawing_term):
         return True
-    # A prompt label means the following text is intended as an image prompt.
+
+
+    # Natural requests such as "bana bir kedi çiz" / "draw a cat" need not
+    # contain the word image or picture.
+    if has_drawing_term:
+        return True
+
+
+    # Explicit prompt labels and common English image-generation phrasing.
     if re.search(r"(?:^|\n)\s*(?:\*\*)?\s*(?:image\s+)?prompt\s*:", text):
         return True
-    # Common standalone prompt-to-image wording, regardless of subject or scene.
-    prompt_intent_phrases = (
+    prompt_phrases = (
         "prompt ile oluştur", "promptla oluştur", "prompt ile üret", "promptla üret",
         "bunu görsele dönüştür", "görsele dönüştür", "resme dönüştür",
         "generate from this prompt", "turn this into an image", "visual version of this",
         "create a visual", "make it visual", "as an image", "in image form",
     )
-    return any(phrase in text for phrase in prompt_intent_phrases)
+    return any(phrase in text for phrase in prompt_phrases)
 
 def detect_image_edit_request(user_text: str) -> bool:
  """Detect general follow-up instructions that ask to change an existing image."""
@@ -439,23 +460,15 @@ st.markdown(
  }
 
  @media (max-width: 700px) {
-
      .st-key-mic_toggle_button {
-
-         right: 4.25rem !important;
-
-         bottom: 3.5rem !important;
-
+         right: 0.75rem !important;
+         bottom: 1rem !important;
      }
-
      div[data-testid="stChatInput"] {
-
-         width: calc(100% - 4.25rem) !important;
-
-         max-width: calc(100% - 4.25rem) !important;
-
+         width: calc(100% - 5.25rem) !important;
+         max-width: calc(100% - 5.25rem) !important;
+         margin-right: 5.25rem !important;
      }
-
  }
 
  </style>
