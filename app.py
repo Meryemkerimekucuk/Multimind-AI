@@ -405,12 +405,6 @@ st.markdown(
 
  <style>
 
- /* Sidebar genişliğine müdahale ETME: Streamlit doğal resize/collapse davranışı */
-
- /* Streamlit'in doğal alt composer'ı main alanına göre konumlanır.
-
-    Mikrofon yalnızca sağ kenara sabitlenir; sidebar genişliğini etkilemez. */
-
  .st-key-mic_toggle_button {
 
      position: fixed !important;
@@ -439,9 +433,6 @@ st.markdown(
 
  }
 
- /* Input, Streamlit'in main alanına göre alt konumlandırmasını korur.
-
-    Sağda mikrofon için küçük yer bırakılır. */
 
  div[data-testid="stChatInput"] {
 
@@ -451,7 +442,6 @@ st.markdown(
 
  }
 
- /* Alt giriş arkasında sohbet mesajları kalmasın */
 
  section[data-testid="stMain"] .block-container {
 
@@ -629,7 +619,7 @@ if user_prompt is not None:
              audio_mime = attachment.get("type") or mimetypes.guess_type(attachment["name"])[0] or "audio/mpeg"
              audio_name = attachment["name"]
              audio_prompt = user_text or "Bu ses kaydını yazıya dök, içeriğini analiz et ve önemli noktaları açıkla."
-             with st.spinner(f"🎧 {audio_name} Gemini ile analiz ediliyor..."):
+             with st.spinner(f"🎧 {audio_name} analiz ediliyor..."):
                  audio_answer = safe_analyze_audio(audio_prompt, audio_bytes, audio_mime, max_output_tokens=1800)
              if audio_answer:
                  save_message("assistant", audio_answer)
@@ -637,7 +627,7 @@ if user_prompt is not None:
                  st.error("Ses analiz edilemedi. Gemini API anahtarını ve ses dosyasının formatını kontrol et.")
          elif is_edit_request:
              source_bytes, source_mime, source_name = image_files[-1]
-             with st.spinner("🪄 Görselin Cloudflare ile düzenleniyor..."):
+             with st.spinner("🪄 Görsel düzenleniyor..."):
                  edited_bytes = edit_image(source_bytes, source_mime, user_text)
              edited_name = f"edited_{chat_id}_{len(st.session_state.messages)}.png"
              edited_path = GENERATED_DIR / edited_name
@@ -648,7 +638,7 @@ if user_prompt is not None:
                  [{"path": path_string, "name": edited_name, "type": "generated_image"}],
              )
          elif is_generation_request:
-             with st.spinner("🎨 Görselin Cloudflare ile oluşturuluyor..."):
+             with st.spinner("🎨 Görsel oluşturuluyor..."):
                  generated_bytes = generate_image(user_text)
              generated_name = f"generated_{chat_id}_{len(st.session_state.messages)}.png"
              generated_path = GENERATED_DIR / generated_name
@@ -661,7 +651,7 @@ if user_prompt is not None:
          else:
              assistant_parts = []
              for image_bytes, mime_type, image_name in image_files:
-                 with st.spinner(f"🖼️ {image_name} Cloudflare ile analiz ediliyor..."):
+                 with st.spinner(f"🖼️ {image_name} Analiz ediliyor..."):
                      image_answer = analyze_image(
                          image_bytes,
                          mime_type,
@@ -677,7 +667,7 @@ if user_prompt is not None:
 Bu sohbet içinde yüklenmiş belgelerin içerikleri:
 {document_context}
 Yanıtını belgelerin içeriğine dayandır. Belgede bulunmayan bilgileri açıkça belirt. Kullanıcı takip sorusu soruyorsa önceki belge bağlamını kullan."""
-                 with st.spinner("📄 Belgeler Gemini ile analiz ediliyor..."):
+                 with st.spinner("📄 Belgeler analiz ediliyor..."):
                      document_answer = safe_generate_text(
                          document_prompt,
                          temperature=0.7,
